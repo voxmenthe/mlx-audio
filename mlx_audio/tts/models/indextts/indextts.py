@@ -1,9 +1,8 @@
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Union
 
-import dacite
 import huggingface_hub
 import mlx.core as mx
 import mlx.nn as nn
@@ -24,6 +23,7 @@ from mlx_audio.tts.models.indextts.conformer import Conformer, ConformerArgs
 from mlx_audio.tts.models.indextts.gpt2 import GPT2Model
 from mlx_audio.tts.models.indextts.mel import log_mel_spectrogram
 from mlx_audio.tts.models.indextts.perceiver import PerceiverResampler
+from mlx_audio.utils import from_dict, load_audio
 
 
 @dataclass
@@ -64,7 +64,7 @@ class Model(nn.Module):
         super().__init__()
 
         if isinstance(args, dict):
-            args = dacite.from_dict(ModelArgs, args)
+            args = from_dict(ModelArgs, args)
 
         if not args.gpt.use_mel_codes_as_input:
             raise NotImplementedError(
@@ -257,10 +257,11 @@ class Model(nn.Module):
     def prepare_input_embedding(
         self,
         prompts: List[str],
-        ref_audio: Optional[mx.array],
+        ref_audio: Optional[Union[str, mx.array]],
         ref_mel: Optional[mx.array] = None,
     ) -> mx.array:
         if ref_audio is not None:
+            ref_audio = load_audio(ref_audio, sample_rate=self.sample_rate)
             ref_mel = log_mel_spectrogram(ref_audio)
 
         if ref_mel is None:
@@ -352,14 +353,16 @@ class Model(nn.Module):
     def generate(
         self,
         text: str,
-        ref_audio: Optional[mx.array],
+        ref_audio: Optional[Union[str, mx.array]],
         ref_mel: Optional[mx.array] = None,
         verbose: bool = False,
         max_tokens: int = 5000,
         sampler: Optional[Callable[..., mx.array]] = None,
         **kwargs,
     ):
+        # Load reference audio if provided (handles file paths and mx.array)
         if ref_audio is not None:
+            ref_audio = load_audio(ref_audio, sample_rate=self.sample_rate)
             ref_mel = log_mel_spectrogram(ref_audio)
 
         if ref_mel is None:

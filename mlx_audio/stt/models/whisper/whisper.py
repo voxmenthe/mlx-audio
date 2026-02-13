@@ -30,7 +30,209 @@ from .decoding import DecodingOptions, DecodingResult
 from .decoding import decode as decode_function
 from .decoding import detect_language as detect_language_function
 from .timing import add_word_timestamps
-from .tokenizer import LANGUAGES, get_tokenizer
+from .tokenizer import LANGUAGES, TO_LANGUAGE_CODE
+
+
+class HFTokenizerWrapper:
+    """
+    Wrapper around HuggingFace WhisperTokenizer that provides a compatible interface
+    for Whisper decoding.
+    """
+
+    def __init__(
+        self,
+        hf_tokenizer,
+        multilingual: bool = True,
+        num_languages: int = 99,
+        language: str = None,
+        task: str = "transcribe",
+    ):
+        self.hf_tokenizer = hf_tokenizer
+        self.multilingual = multilingual
+        self.num_languages = num_languages
+        self.language = language or "en"
+        self.task = task or "transcribe"
+
+        # Normalize language code
+        if self.language in TO_LANGUAGE_CODE:
+            self.language = TO_LANGUAGE_CODE[self.language]
+
+    def encode(self, text: str) -> List[int]:
+        """Encode text to token ids."""
+        return self.hf_tokenizer.encode(text, add_special_tokens=False)
+
+    def decode(self, tokens, skip_special_tokens: bool = False) -> str:
+        """Decode token ids to text."""
+        if hasattr(tokens, "tolist"):
+            tokens = tokens.tolist()
+        # Filter out timestamp tokens for regular decode
+        filtered = [t for t in tokens if t < self.timestamp_begin]
+        return self.hf_tokenizer.decode(
+            filtered, skip_special_tokens=skip_special_tokens
+        )
+
+    def decode_with_timestamps(self, tokens, **kwargs) -> str:
+        """Decode tokens including timestamp tokens."""
+        if hasattr(tokens, "tolist"):
+            tokens = tokens.tolist()
+        return self.hf_tokenizer.decode(tokens, skip_special_tokens=False)
+
+    @property
+    def eot(self) -> int:
+        """End of transcript token."""
+        return self.hf_tokenizer.eos_token_id
+
+    @property
+    def timestamp_begin(self) -> int:
+        """First timestamp token id."""
+        return self.hf_tokenizer.convert_tokens_to_ids("<|0.00|>")
+
+    @property
+    def sot(self) -> int:
+        """Start of transcript token."""
+        return self.hf_tokenizer.convert_tokens_to_ids("<|startoftranscript|>")
+
+    @property
+    def sot_lm(self) -> int:
+        """Start of language model token."""
+        return self.hf_tokenizer.convert_tokens_to_ids("<|startoflm|>")
+
+    @property
+    def no_timestamps(self) -> int:
+        """No timestamps token."""
+        return self.hf_tokenizer.convert_tokens_to_ids("<|notimestamps|>")
+
+    @property
+    def no_speech(self) -> int:
+        """No speech token."""
+        return self.hf_tokenizer.convert_tokens_to_ids("<|nospeech|>")
+
+    @property
+    def transcribe(self) -> int:
+        """Transcribe task token."""
+        return self.hf_tokenizer.convert_tokens_to_ids("<|transcribe|>")
+
+    @property
+    def translate(self) -> int:
+        """Translate task token."""
+        return self.hf_tokenizer.convert_tokens_to_ids("<|translate|>")
+
+    @property
+    def sot_prev(self) -> int:
+        """Start of previous token."""
+        return self.hf_tokenizer.convert_tokens_to_ids("<|startofprev|>")
+
+    @property
+    def language_token(self) -> int:
+        """Language token for the configured language."""
+        return self.hf_tokenizer.convert_tokens_to_ids(f"<|{self.language}|>")
+
+    @property
+    def sot_sequence(self) -> Tuple[int, ...]:
+        """Start of transcript sequence including language and task tokens."""
+        if self.multilingual:
+            return (self.sot, self.language_token, self.task_token)
+        return (self.sot,)
+
+    @property
+    def sot_sequence_including_notimestamps(self) -> Tuple[int, ...]:
+        """Start of transcript sequence including notimestamps token."""
+        return tuple(list(self.sot_sequence) + [self.no_timestamps])
+
+    @property
+    def task_token(self) -> int:
+        """Task token (transcribe or translate)."""
+        if self.task == "translate":
+            return self.translate
+        return self.transcribe
+
+    @property
+    def all_language_tokens(self) -> Tuple[int, ...]:
+        """All language token ids."""
+        result = []
+        for lang in list(LANGUAGES.keys())[: self.num_languages]:
+            token_id = self.hf_tokenizer.convert_tokens_to_ids(f"<|{lang}|>")
+            if token_id != self.hf_tokenizer.unk_token_id:
+                result.append(token_id)
+        return tuple(result)
+
+    @property
+    def all_language_codes(self) -> Tuple[str, ...]:
+        """All language codes."""
+        return tuple(list(LANGUAGES.keys())[: self.num_languages])
+
+    @property
+    def non_speech_tokens(self) -> Tuple[int, ...]:
+        """Tokens to suppress to avoid non-speech annotations."""
+        import string
+
+        symbols = list('"#()*+/:;<=>@[\\]^_`{|}~「」『』')
+        symbols += (
+            "<< >> <<< >>> -- --- -( -[ (' (\" (( )) ((( ))) [[ ]] {{ }} ♪♪ ♪♪♪".split()
+        )
+
+        miscellaneous = set("♩♪♫♬♭♮♯")
+
+        result = {self.encode(" -")[0], self.encode(" '")[0]}
+        for symbol in symbols + list(miscellaneous):
+            for tokens in [self.encode(symbol), self.encode(" " + symbol)]:
+                if len(tokens) == 1 or symbol in miscellaneous:
+                    result.add(tokens[0])
+
+        return tuple(sorted(result))
+
+    def split_to_word_tokens(self, tokens: List[int]):
+        """Split tokens into words."""
+        if self.language in {"zh", "ja", "th", "lo", "my", "yue"}:
+            return self._split_tokens_on_unicode(tokens)
+        return self._split_tokens_on_spaces(tokens)
+
+    def _split_tokens_on_unicode(self, tokens: List[int]):
+        """Split tokens at unicode boundaries."""
+        decoded_full = self.decode_with_timestamps(tokens)
+        replacement_char = "\ufffd"
+
+        words = []
+        word_tokens = []
+        current_tokens = []
+        unicode_offset = 0
+
+        for token in tokens:
+            current_tokens.append(token)
+            decoded = self.decode_with_timestamps(current_tokens)
+
+            if (
+                replacement_char not in decoded
+                or decoded_full[unicode_offset + decoded.index(replacement_char)]
+                == replacement_char
+            ):
+                words.append(decoded)
+                word_tokens.append(current_tokens)
+                current_tokens = []
+                unicode_offset += len(decoded)
+
+        return words, word_tokens
+
+    def _split_tokens_on_spaces(self, tokens: List[int]):
+        """Split tokens at space boundaries."""
+        import string
+
+        subwords, subword_tokens_list = self._split_tokens_on_unicode(tokens)
+        words = []
+        word_tokens = []
+
+        for subword, subword_tokens in zip(subwords, subword_tokens_list):
+            special = subword_tokens[0] >= self.eot
+            with_space = subword.startswith(" ")
+            punctuation = subword.strip() in string.punctuation
+            if special or with_space or punctuation or len(words) == 0:
+                words.append(subword)
+                word_tokens.append(subword_tokens)
+            else:
+                words[-1] = words[-1] + subword
+                word_tokens[-1].extend(subword_tokens)
+
+        return words, word_tokens
 
 
 def _format_timestamp(seconds: float):
@@ -76,6 +278,42 @@ class ModelDimensions:
     n_text_state: int
     n_text_head: int
     n_text_layer: int
+
+    @classmethod
+    def from_dict(cls, config: dict) -> "ModelDimensions":
+        """Create ModelDimensions from a config dict.
+
+        Handles both MLX format (n_mels, n_audio_ctx, etc.) and
+        HuggingFace transformers format (d_model, encoder_layers, etc.).
+        """
+        config = config.copy()
+
+        # Check if this is HuggingFace format (has d_model or encoder_layers)
+        if "d_model" in config or "encoder_layers" in config:
+            # Map HuggingFace config to MLX format
+            return cls(
+                n_mels=config.get("num_mel_bins", 128),
+                n_audio_ctx=config.get("max_source_positions", 1500),
+                n_audio_state=config.get("d_model", 1280),
+                n_audio_head=config.get("encoder_attention_heads", 20),
+                n_audio_layer=config.get("encoder_layers", 32),
+                n_vocab=config.get("vocab_size", 51866),
+                n_text_ctx=config.get("max_target_positions", 448),
+                n_text_state=config.get("d_model", 1280),
+                n_text_head=config.get("decoder_attention_heads", 20),
+                n_text_layer=config.get("decoder_layers", 32),
+            )
+
+        # MLX format - filter to known fields
+        config.pop("model_type", None)
+        config.pop("quantization", None)
+        known_fields = {f.name for f in cls.__dataclass_fields__.values()}
+        filtered = {k: v for k, v in config.items() if k in known_fields}
+        return cls(**filtered)
+
+
+# Alias for compatibility with load_model
+ModelConfig = ModelDimensions
 
 
 def sinusoids(length, channels, max_timescale=10000):
@@ -275,22 +513,91 @@ class Model(nn.Module):
             (self.dims.n_text_layer, self.dims.n_text_head), dtype=bool
         )
         all_heads[self.dims.n_text_layer // 2 :] = True
-        self.alignment_heads = mx.array(np.asarray(all_heads.nonzero()).T)
+        self._alignment_heads = mx.array(np.asarray(all_heads.nonzero()).T)
 
     def set_alignment_heads(self, dump: Union[bytes, np.ndarray]):
         if isinstance(dump, np.ndarray):
-            self.alignment_heads = mx.array(dump)
+            self._alignment_heads = mx.array(dump)
         elif isinstance(dump, bytes):
             array = np.frombuffer(
                 gzip.decompress(base64.b85decode(dump)), dtype=bool
             ).copy()
             mask = array.reshape(self.dims.n_text_layer, self.dims.n_text_head)
-            self.alignment_heads = mx.array(np.asarray(mask.nonzero()).T)
+            self._alignment_heads = mx.array(np.asarray(mask.nonzero()).T)
         else:
             raise ValueError(
                 f"Invalid type for `dump`: {type(dump)}. Expected a np.ndarray or base85-encoded bytes containing"
                 " alignment_head information"
             )
+
+    def sanitize(self, weights: dict) -> dict:
+        """Sanitize weights for MLX compatibility.
+
+        Handles:
+        - Removing 'model.' prefix (HuggingFace format)
+        - Remapping HuggingFace key names to MLX key names
+        - Transposing Conv1d weights from (out, in, kernel) to (out, kernel, in)
+        - Converting to model dtype
+        """
+        # Key remapping from HuggingFace to MLX format
+        # Order matters: more specific patterns must come before generic ones
+        key_map = [
+            ("encoder.embed_positions.weight", None),  # Skip, computed in MLX
+            ("decoder.embed_positions.weight", "decoder.positional_embedding"),
+            ("encoder.layer_norm.", "encoder.ln_post."),
+            ("decoder.layer_norm.", "decoder.ln."),
+            ("encoder.layers.", "encoder.blocks."),
+            ("decoder.layers.", "decoder.blocks."),
+            (".self_attn_layer_norm.", ".attn_ln."),
+            (".final_layer_norm.", ".mlp_ln."),
+            (".encoder_attn_layer_norm.", ".cross_attn_ln."),
+            (".fc1.", ".mlp1."),
+            (".fc2.", ".mlp2."),
+            # Attention mappings - specific before generic
+            (".self_attn.q_proj.", ".attn.query."),
+            (".self_attn.k_proj.", ".attn.key."),
+            (".self_attn.v_proj.", ".attn.value."),
+            (".self_attn.out_proj.", ".attn.out."),
+            (".encoder_attn.q_proj.", ".cross_attn.query."),
+            (".encoder_attn.k_proj.", ".cross_attn.key."),
+            (".encoder_attn.v_proj.", ".cross_attn.value."),
+            (".encoder_attn.out_proj.", ".cross_attn.out."),
+            ("decoder.embed_tokens.", "decoder.token_embedding."),
+        ]
+
+        # Check if this is HuggingFace format (has 'model.' prefix)
+        is_hf_format = any(k.startswith("model.") for k in weights.keys())
+
+        sanitized = {}
+        for k, v in weights.items():
+            if is_hf_format:
+                # Remove 'model.' prefix if present (HuggingFace format)
+                if k.startswith("model."):
+                    k = k[6:]
+
+                # Apply key remapping
+                skip = False
+                for old, new in key_map:
+                    if old in k:
+                        if new is None:
+                            skip = True
+                            break
+                        k = k.replace(old, new)
+
+                if skip:
+                    continue
+
+                # Transpose Conv1d weights: HF uses (out, in, kernel), MLX uses (out, kernel, in)
+                if "conv1.weight" in k or "conv2.weight" in k:
+                    if v.ndim == 3:
+                        v = v.transpose(0, 2, 1)
+
+            # Convert to model dtype
+            if v.dtype != self.dtype and v.dtype != mx.uint32:
+                v = v.astype(self.dtype)
+
+            sanitized[k] = v
+        return sanitized
 
     def embed_audio(self, mel):
         return self.encoder(mel)
@@ -319,9 +626,23 @@ class Model(nn.Module):
     @classmethod
     def from_pretrained(
         cls,
-        path_or_hf_repo: str = "mlx-community/whisper-tiny",
+        path_or_hf_repo: str = "mlx-community/whisper-tiny-asr-fp16",
         dtype: mx.Dtype = mx.float16,
     ) -> "Whisper":
+        """
+        Load a pretrained Whisper model.
+
+        .. deprecated::
+            Use `mlx_audio.stt.load()` instead. This method will be removed in a future version.
+        """
+        import glob
+
+        warnings.warn(
+            "Model.from_pretrained() is deprecated. Use mlx_audio.stt.load() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
         model_path = Path(path_or_hf_repo)
         if not model_path.exists():
             model_path = Path(snapshot_download(repo_id=path_or_hf_repo))
@@ -331,12 +652,12 @@ class Model(nn.Module):
             config.pop("model_type", None)
             quantization = config.pop("quantization", None)
 
-        model_args = ModelDimensions(**config)
+        model_args = ModelDimensions.from_dict(config)
 
-        wf = model_path / "weights.safetensors"
-        if not wf.exists():
-            wf = model_path / "weights.npz"
-        weights = mx.load(str(wf))
+        wf = glob.glob(str(model_path / "*.safetensors"))
+        weights = {}
+        for wf in wf:
+            weights.update(mx.load(wf))
 
         model = Model(model_args, dtype)
 
@@ -352,11 +673,104 @@ class Model(nn.Module):
         mx.eval(model.parameters())
         return model
 
+    @staticmethod
+    def post_load_hook(model: "Model", model_path: Path) -> "Model":
+        """
+        Post-load hook called by load_model to initialize the processor.
+
+        Args:
+            model: The loaded model instance
+            model_path: Path to the model directory
+
+        Returns:
+            The model with processor initialized
+        """
+        try:
+            from transformers import WhisperProcessor
+
+            processor = WhisperProcessor.from_pretrained(str(model_path))
+            model._processor = processor
+        except Exception as e:
+            model._processor = None
+            warnings.warn(f"Could not load WhisperProcessor: {e}.")
+
+        return model
+
+    def get_tokenizer(self, language: str = None, task: str = "transcribe"):
+        """
+        Get a tokenizer for the current model configuration.
+
+        Args:
+            language: Language code (e.g., "en", "ja"). If None, uses "en" for multilingual.
+            task: Either "transcribe" or "translate".
+
+        Returns:
+            A tokenizer instance with encode/decode methods and special token properties.
+        """
+        if hasattr(self, "_processor") and self._processor is not None:
+            return HFTokenizerWrapper(
+                self._processor.tokenizer,
+                multilingual=self.is_multilingual,
+                num_languages=self.num_languages,
+                language=language,
+                task=task,
+            )
+        else:
+            raise ValueError(
+                "Processor not found. Make sure the model was loaded with a HuggingFace processor."
+            )
+
+    def _prepare_audio(
+        self, audio: Union[str, np.ndarray, mx.array], padding: int = N_SAMPLES
+    ) -> Tuple[mx.array, int]:
+        """Prepare audio for transcription.
+
+        Args:
+            audio: Path to audio file or audio waveform array.
+            padding: Padding samples (default N_SAMPLES for 30s window).
+
+        Returns:
+            Tuple of (mel spectrogram, content_frames).
+        """
+        if isinstance(audio, str):
+            from mlx_audio.stt.utils import load_audio
+
+            audio = load_audio(audio)
+        elif not isinstance(audio, mx.array):
+            audio = mx.array(audio)
+
+        mel = log_mel_spectrogram(audio, n_mels=self.dims.n_mels, padding=padding)
+        content_frames = mel.shape[-2] - N_FRAMES if padding else mel.shape[-2]
+
+        return mel, content_frames
+
+    def _detect_language(self, mel: mx.array, language: Optional[str] = None) -> str:
+        """Detect or validate language for transcription.
+
+        Args:
+            mel: Mel spectrogram.
+            language: Override language code. If None, auto-detect.
+
+        Returns:
+            Language code (e.g., "en", "ja").
+        """
+        if language is not None:
+            return language
+
+        if not self.is_multilingual:
+            return "en"
+
+        mel_segment = pad_or_trim(mel, N_FRAMES, axis=-2).astype(self.dtype)
+        _, probs = self.detect_language(mel_segment)
+        return max(probs, key=probs.get)
+
     def generate(
         self,
         audio: Union[str, np.ndarray, mx.array],
         *,
         verbose: Optional[bool] = None,
+        chunk_duration: float = 1.0,
+        stream: bool = False,
         generation_stream: bool = False,
         temperature: Union[float, Tuple[float, ...]] = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
         compression_ratio_threshold: Optional[float] = 2.4,
@@ -434,12 +848,15 @@ class Model(nn.Module):
         the spoken language ("language"), which is detected when `decode_options["language"]` is None.
         """
 
+        if stream:
+            return self.generate_streaming(
+                audio, chunk_duration=chunk_duration, **decode_options
+            )
+
         decode_options.pop("max_tokens", None)
         decode_options.pop("generation_stream", None)
-
-        # Pad 30-seconds of silence to the input audio, for slicing
-        mel = log_mel_spectrogram(audio, n_mels=self.dims.n_mels, padding=N_SAMPLES)
-        content_frames = mel.shape[-2] - N_FRAMES
+        # Use shared audio preparation
+        mel, content_frames = self._prepare_audio(audio)
         content_duration = float(content_frames * HOP_LENGTH / SAMPLE_RATE)
 
         if verbose:
@@ -451,31 +868,14 @@ class Model(nn.Module):
             else:
                 make_safe = lambda x: x
 
-        if decode_options.get("language", None) is None:
-            if not self.is_multilingual:
-                decode_options["language"] = "en"
-            else:
-                if verbose:
-                    print(
-                        "Detecting language using up to the first 30 seconds. "
-                        "Use the `language` decoding option to specify the language"
-                    )
-                mel_segment = pad_or_trim(mel, N_FRAMES, axis=-2).astype(self.dtype)
-                _, probs = self.detect_language(mel_segment)
-                decode_options["language"] = max(probs, key=probs.get)
-                if verbose is not None:
-                    print(
-                        f"Detected language: {LANGUAGES[decode_options['language']].title()}"
-                    )
-
-        language: str = decode_options["language"]
+        # Use shared language detection
+        language = self._detect_language(mel, language=decode_options.get("language"))
+        if decode_options.get("language") is None:
+            if verbose:
+                print(f"Detected language: {LANGUAGES[language].title()}")
+        decode_options["language"] = language
         task: str = decode_options.get("task", "transcribe")
-        tokenizer = get_tokenizer(
-            self.is_multilingual,
-            num_languages=self.num_languages,
-            language=language,
-            task=task,
-        )
+        tokenizer = self.get_tokenizer(language=language, task=task)
 
         if isinstance(clip_timestamps, str):
             clip_timestamps = [
@@ -865,3 +1265,81 @@ class Model(nn.Module):
             segments=all_segments,
             language=language,
         )
+
+    def generate_streaming(
+        self,
+        audio,
+        *,
+        chunk_duration: float = 1.0,
+        language: str = None,
+        task: str = "transcribe",
+        frame_threshold: int = 25,
+    ):
+        """Generate transcription with streaming output using AlignAtt.
+
+        This method yields partial transcriptions as audio is processed,
+        achieving ~1 second latency instead of waiting for full 30-second windows.
+
+        Args:
+            audio: Path to audio file or audio waveform array.
+            chunk_duration: Duration of each chunk in seconds (default 1.0).
+            language: Language code (e.g., "en"). Auto-detected if None.
+            task: "transcribe" or "translate" (to English).
+            frame_threshold: AlignAtt threshold (lower = faster, higher = more accurate).
+
+        Yields:
+            StreamingResult objects with partial/final transcriptions.
+
+        Example:
+            >>> for result in model.generate_streaming("audio.wav"):
+            ...     print(f"[{'FINAL' if result.is_final else 'partial'}] {result.text}")
+        """
+        from mlx_audio.stt.models.whisper.streaming import (
+            StreamingConfig,
+            StreamingDecoder,
+        )
+        from mlx_audio.stt.utils import load_audio
+
+        # Load audio if path provided
+        if isinstance(audio, str):
+            audio = load_audio(audio)
+        elif not isinstance(audio, mx.array):
+            audio = mx.array(audio)
+
+        # Auto-detect language if not specified
+        if language is None:
+            # Get mel for first chunk to detect language
+            first_chunk = audio[: int(chunk_duration * SAMPLE_RATE)]
+            mel_detect = log_mel_spectrogram(
+                np.array(first_chunk), n_mels=self.dims.n_mels
+            )
+            language = self._detect_language(mel_detect)
+
+        # Configure streaming
+        config = StreamingConfig(frame_threshold=frame_threshold)
+        decoder = StreamingDecoder(self, config, language=language, task=task)
+
+        # Process audio in chunks
+        chunk_samples = int(chunk_duration * SAMPLE_RATE)
+        total_samples = len(audio)
+        audio_duration = total_samples / SAMPLE_RATE
+
+        for start in range(0, total_samples, chunk_samples):
+            end = min(start + chunk_samples, total_samples)
+            chunk = audio[start:end]
+            is_last = end >= total_samples
+
+            mel = log_mel_spectrogram(np.array(chunk), n_mels=self.dims.n_mels)
+            result = decoder.decode_chunk(mel, is_last=is_last)
+
+            # Add progress info
+            result.progress = end / total_samples
+            result.audio_position = end / SAMPLE_RATE
+            result.audio_duration = audio_duration
+            result.language = language
+
+            if result.text.strip() or is_last:
+                yield result
+
+            if is_last:
+                break

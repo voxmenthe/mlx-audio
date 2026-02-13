@@ -9,7 +9,6 @@ import numpy as np
 from mlx.utils import tree_map
 
 from .audio import CHUNK_LENGTH
-from .tokenizer import Tokenizer, get_tokenizer
 
 
 def compression_ratio(text) -> float:
@@ -18,7 +17,7 @@ def compression_ratio(text) -> float:
 
 
 def detect_language(
-    model: "Whisper", mel: mx.array, tokenizer: Tokenizer = None
+    model: "Whisper", mel: mx.array, tokenizer=None
 ) -> Tuple[mx.array, List[dict]]:
     """
     Detect the spoken language in the audio, and return them as list of strings, along with the ids
@@ -33,9 +32,7 @@ def detect_language(
         list of dictionaries containing the probability distribution over all languages.
     """
     if tokenizer is None:
-        tokenizer = get_tokenizer(
-            model.is_multilingual, num_languages=model.num_languages
-        )
+        tokenizer = model.get_tokenizer()
     if (
         tokenizer.language is None
         or tokenizer.language_token not in tokenizer.sot_sequence
@@ -77,6 +74,41 @@ def detect_language(
         language_probs = language_probs[0]
 
     return language_tokens, language_probs
+
+
+def get_suppress_tokens(tokenizer, suppress_tokens: str = "-1") -> Tuple[int, ...]:
+    """Build suppress tokens list for decoding.
+
+    Args:
+        tokenizer: Whisper tokenizer instance.
+        suppress_tokens: Token specification. "-1" means non-speech tokens.
+
+    Returns:
+        Tuple of token IDs to suppress.
+    """
+    if isinstance(suppress_tokens, str):
+        suppress_tokens = [int(t) for t in suppress_tokens.split(",")]
+
+    result = list(suppress_tokens) if suppress_tokens else []
+
+    if -1 in result:
+        result = [t for t in result if t >= 0]
+        result.extend(tokenizer.non_speech_tokens)
+
+    result.extend(
+        [
+            tokenizer.transcribe,
+            tokenizer.translate,
+            tokenizer.sot,
+            tokenizer.sot_prev,
+            tokenizer.sot_lm,
+        ]
+    )
+
+    if tokenizer.no_speech is not None:
+        result.append(tokenizer.no_speech)
+
+    return tuple(sorted(set(result)))
 
 
 @dataclass(frozen=True)
@@ -140,6 +172,20 @@ class Inference:
             tokens, audio_features, kv_cache=self.kv_cache
         )
         return logits.astype(mx.float32)
+
+    def logits_with_cross_qk(self, tokens: mx.array, audio_features: mx.array) -> tuple:
+        """Perform forward pass and return logits WITH cross-attention weights.
+
+        This method is used for AlignAtt streaming to monitor attention patterns.
+
+        Returns:
+            tuple: (logits, cross_qk) where cross_qk is list of attention weights
+                   per decoder layer, shape [batch, n_heads, seq_len, audio_len]
+        """
+        logits, self.kv_cache, cross_qk = self.model.decoder(
+            tokens, audio_features, kv_cache=self.kv_cache
+        )
+        return logits.astype(mx.float32), cross_qk
 
     def rearrange_kv_cache(self, source_indices):
         """Update the key-value cache according to the updated beams"""
@@ -300,7 +346,7 @@ class LogitFilter:
 
 
 class SuppressBlank(LogitFilter):
-    def __init__(self, tokenizer: Tokenizer, sample_begin: int, n_vocab: int):
+    def __init__(self, tokenizer, sample_begin: int, n_vocab: int):
         self.sample_begin = sample_begin
         mask = np.zeros(n_vocab, np.float32)
         mask[tokenizer.encode(" ") + [tokenizer.eot]] = -np.inf
@@ -325,7 +371,7 @@ class SuppressTokens(LogitFilter):
 class ApplyTimestampRules(LogitFilter):
     def __init__(
         self,
-        tokenizer: Tokenizer,
+        tokenizer,
         sample_begin: int,
         max_initial_timestamp_index: Optional[int],
     ):
@@ -405,13 +451,8 @@ class DecodingTask:
         self.model = model
 
         language = options.language or "en"
-        tokenizer = get_tokenizer(
-            model.is_multilingual,
-            num_languages=model.num_languages,
-            language=language,
-            task=options.task,
-        )
-        self.tokenizer: Tokenizer = tokenizer
+        tokenizer = model.get_tokenizer(language=language, task=options.task)
+        self.tokenizer = tokenizer
         self.options: DecodingOptions = self._verify_options(options)
 
         self.n_group: int = options.beam_size or options.best_of or 1
@@ -446,7 +487,10 @@ class DecodingTask:
             )
         if self.options.suppress_tokens:
             self.logit_filters.append(
-                SuppressTokens(self._get_suppress_tokens(), model.dims.n_vocab)
+                SuppressTokens(
+                    get_suppress_tokens(self.tokenizer, self.options.suppress_tokens),
+                    model.dims.n_vocab,
+                )
             )
 
         if not options.without_timestamps:
@@ -504,35 +548,6 @@ class DecodingTask:
             )
 
         return tuple(tokens)
-
-    def _get_suppress_tokens(self) -> Tuple[int]:
-        suppress_tokens = self.options.suppress_tokens
-
-        if isinstance(suppress_tokens, str):
-            suppress_tokens = [int(t) for t in suppress_tokens.split(",")]
-
-        if -1 in suppress_tokens:
-            suppress_tokens = [t for t in suppress_tokens if t >= 0]
-            suppress_tokens.extend(self.tokenizer.non_speech_tokens)
-        elif suppress_tokens is None or len(suppress_tokens) == 0:
-            suppress_tokens = []  # interpret empty string as an empty list
-        else:
-            assert isinstance(suppress_tokens, list), "suppress_tokens must be a list"
-
-        suppress_tokens.extend(
-            [
-                self.tokenizer.transcribe,
-                self.tokenizer.translate,
-                self.tokenizer.sot,
-                self.tokenizer.sot_prev,
-                self.tokenizer.sot_lm,
-            ]
-        )
-        if self.tokenizer.no_speech is not None:
-            # no-speech probability is collected separately
-            suppress_tokens.append(self.tokenizer.no_speech)
-
-        return tuple(sorted(set(suppress_tokens)))
 
     def _get_audio_features(self, mel: mx.array):
         if self.options.fp16:
@@ -618,7 +633,7 @@ class DecodingTask:
     def run(self, mel: mx.array) -> List[DecodingResult]:
         self.inference.reset()
         self.decoder.reset()
-        tokenizer: Tokenizer = self.tokenizer
+        tokenizer = self.tokenizer
         n_audio: int = mel.shape[0]
 
         audio_features: mx.array = self._get_audio_features(mel)  # encoder forward pass

@@ -1,6 +1,4 @@
 import glob
-import importlib
-import json
 import logging
 import shutil
 from pathlib import Path
@@ -9,52 +7,29 @@ from typing import List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
-from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten
-from mlx_lm.convert import mixed_quant_predicate_builder
-from mlx_lm.utils import dequantize_model, quantize_model, save_config, save_model
-from transformers import AutoConfig
 
-MODEL_REMAPPING = {"outetts": "outetts", "spark": "spark", "csm": "sesame"}
+from mlx_audio.utils import (
+    base_load_model,
+    get_model_class,
+    get_model_path,
+    load_config,
+)
+
+MODEL_REMAPPING = {
+    "qwen3_tts": "qwen3_tts",
+    "outetts": "outetts",
+    "spark": "spark",
+    "marvis": "sesame",
+    "csm": "sesame",
+    "voxcpm": "voxcpm",
+    "voxcpm1.5": "voxcpm",
+    "vibevoice_streaming": "vibevoice",
+    "chatterbox_turbo": "chatterbox_turbo",
+    "soprano": "soprano",
+}
 MAX_FILE_SIZE_GB = 5
 MODEL_CONVERSION_DTYPES = ["float16", "bfloat16", "float32"]
-
-
-def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path:
-    """
-    Ensures the model is available locally. If the path does not exist locally,
-    it is downloaded from the Hugging Face Hub.
-
-    Args:
-        path_or_hf_repo (str): The local path or Hugging Face repository ID of the model.
-        revision (str, optional): A revision id which can be a branch name, a tag, or a commit hash.
-
-    Returns:
-        Path: The path to the model.
-    """
-    model_path = Path(path_or_hf_repo)
-
-    if not model_path.exists():
-        model_path = Path(
-            snapshot_download(
-                path_or_hf_repo,
-                revision=revision,
-                allow_patterns=[
-                    "*.json",
-                    "*.safetensors",
-                    "*.py",
-                    "*.model",
-                    "*.tiktoken",
-                    "*.txt",
-                    "*.jsonl",
-                    "*.yaml",
-                    "*.wav",
-                    "*.txt",
-                ],
-            )
-        )
-
-    return model_path
 
 
 # Get a list of all available model types from the models directory
@@ -97,56 +72,12 @@ def get_model_and_args(model_type: str, model_name: List[str]):
     Raises:
         ValueError: If the model type is not supported (module import fails).
     """
-    # Stage 1: Check if the model type is in the remapping
-    model_type = MODEL_REMAPPING.get(model_type, model_type)
-
-    # Stage 2: Check for partial matches in segments of the model name
-    models = get_available_models()
-    if model_name is not None:
-        for part in model_name:
-            # First check if the part matches an available model directory name
-            if part in models:
-                model_type = part
-
-            # Then check if the part is in our custom remapping dictionary
-            if part in MODEL_REMAPPING:
-                model_type = MODEL_REMAPPING[part]
-                break
-
-    try:
-        arch = importlib.import_module(f"mlx_audio.tts.models.{model_type}")
-    except ImportError:
-        msg = f"Model type {model_type} not supported."
-        logging.error(msg)
-        raise ValueError(msg)
-
-    return arch, model_type
-
-
-def load_config(model_path: Union[str, Path], **kwargs) -> dict:
-    """Load model configuration from a path or Hugging Face repo.
-
-    Args:
-        model_path: Local path or Hugging Face repo ID to load config from
-        **kwargs: Additional keyword arguments to pass to the config loader
-
-    Returns:
-        dict: Model configuration
-
-    Raises:
-        FileNotFoundError: If config.json is not found at the path
-    """
-    if isinstance(model_path, str):
-        model_path = get_model_path(model_path)
-
-    try:
-        return AutoConfig.from_pretrained(model_path, **kwargs).to_dict()
-    except ValueError:
-        try:
-            with open(model_path / "config.json", encoding="utf-8") as f:
-                return json.load(f)
-        except FileNotFoundError as exc:
-            raise FileNotFoundError(f"Config not found at {model_path}") from exc
+    return get_model_class(
+        model_type=model_type,
+        model_name=model_name,
+        category="tts",
+        model_remapping=MODEL_REMAPPING,
+    )
 
 
 def load_model(
@@ -168,106 +99,42 @@ def load_model(
         FileNotFoundError: If the weight files (.safetensors) are not found.
         ValueError: If the model class or args class are not found or cannot be instantiated.
     """
-    model_name = None
-    if isinstance(model_path, str):
-        model_name = model_path.lower().split("/")[-1].split("-")
-        model_path = get_model_path(model_path)
-    elif isinstance(model_path, Path):
-        index = model_path.parts.index("hub")
-        model_name = model_path.parts[index + 1].lower().split("--")[-1].split("-")
-    else:
-        raise ValueError(f"Invalid model path type: {type(model_path)}")
-
-    config = load_config(model_path, **kwargs)
-    config["tokenizer_name"] = model_path
-
-    # Determine model_type from config or model_name
-    model_type = config.get("model_type", None)
-    if model_type is None:
-        model_type = model_name[0].lower() if model_name is not None else None
-
-    quantization = config.get("quantization", None)
-
-    weight_files = glob.glob(str(model_path / "*.safetensors"))
-    if not weight_files:
-        # Check in LLM directory if no safetensors found in the main directory
-        # For Spark model
-        weight_files = glob.glob(str(model_path / "LLM" / "*.safetensors"))
-
-    if not weight_files:
-        logging.error(f"No safetensors found in {model_path}")
-        message = f"""
-No safetensors found in {model_path}
-Create safetensors using the following code:
-```
-from transformers import AutoModelForCausalLM, AutoProcessor
-
-model_id= "<huggingface_model_id>"
-model = AutoModelForCausalLM.from_pretrained(model_id)
-processor = AutoProcessor.from_pretrained(model_id)
-
-model.save_pretrained("<local_dir>")
-processor.save_pretrained("<local_dir>")
-```
-Then use the <local_dir> as the --hf-path in the convert script.
-```
-python -m mlx_audio.tts.convert --hf-path <local_dir> --mlx-path <mlx_dir>
-```
-        """
-        raise FileNotFoundError(message)
-
-    weights = {}
-    for wf in weight_files:
-        weights.update(mx.load(wf))
-
-    model_class, model_type = get_model_and_args(
-        model_type=model_type, model_name=model_name
+    return base_load_model(
+        model_path=model_path,
+        category="tts",
+        model_remapping=MODEL_REMAPPING,
+        lazy=lazy,
+        strict=strict,
+        **kwargs,
     )
 
-    # Get model config from model class if it exists, otherwise use the config
-    model_config = (
-        model_class.ModelConfig.from_dict(config)
-        if hasattr(model_class, "ModelConfig")
-        else config
-    )
 
-    if model_config is not None and hasattr(model_config, "model_path"):
-        # For Spark model
-        model_config.model_path = model_path
+def load(
+    model_path: Union[str, Path], lazy: bool = False, strict: bool = True, **kwargs
+) -> nn.Module:
+    """
+    Load a text-to-speech model from a local path or HuggingFace repository.
 
-    model = model_class.Model(model_config)
-    quantization = config.get("quantization", None)
-    if quantization is None:
-        weights = model.sanitize(weights)
+    This is the main entry point for loading TTS models. It automatically
+    detects the model type and initializes the appropriate model class.
 
-    if (quantization := config.get("quantization", None)) is not None:
+    Args:
+        model_path: The local path or HuggingFace repo ID to load from.
+        lazy: If False, evaluate model parameters immediately.
+        strict: If True, raise an error if any weights are missing.
+        **kwargs: Additional keyword arguments:
+            - revision (str): HuggingFace revision/branch to use
+            - force_download (bool): Force re-download of model files
 
-        def get_class_predicate(p, m):
-            # Handle custom per layer quantizations
-            if p in config["quantization"]:
-                return config["quantization"][p]
-            if not hasattr(m, "to_quantized"):
-                return False
-            # Skip layers not divisible by 64
-            if hasattr(m, "weight") and m.weight.size % 64 != 0:
-                return False
-            # Handle legacy models which may not have everything quantized
-            return f"{p}.scales" in weights
+    Returns:
+        nn.Module: The loaded and initialized model.
 
-        nn.quantize(
-            model,
-            group_size=quantization["group_size"],
-            bits=quantization["bits"],
-            class_predicate=get_class_predicate,
-        )
-
-    model.load_weights(list(weights.items()), strict=strict)
-
-    if not lazy:
-        mx.eval(model.parameters())
-
-    model.eval()
-    return model
+    Example:
+        >>> from mlx_audio.tts import load
+        >>> model = load("mlx-community/outetts-0.3-500M-bf16")
+        >>> audio = model.generate("Hello world!")
+    """
+    return load_model(model_path, lazy=lazy, strict=strict, **kwargs)
 
 
 def fetch_from_hub(
@@ -338,6 +205,9 @@ def convert(
     trust_remote_code: bool = True,
     quant_predicate: Optional[str] = None,
 ):
+    from mlx_lm.convert import mixed_quant_predicate_builder
+    from mlx_lm.utils import dequantize_model, quantize_model, save_config, save_model
+
     print("[INFO] Loading")
     model_path = get_model_path(hf_path, revision=revision)
     model, config = fetch_from_hub(
@@ -348,17 +218,15 @@ def convert(
         quant_predicate = mixed_quant_predicate_builder(quant_predicate, model)
 
     # Get model-specific quantization predicate if available
-    model_quant_predicate = getattr(
-        model, "model_quant_predicate", lambda p, m, config: True
-    )
+    model_quant_predicate = getattr(model, "model_quant_predicate", lambda p, m: True)
 
     # Define base quantization requirements
-    def base_quant_requirements(p, m, config):
+    def base_quant_requirements(p, m):
         return (
             hasattr(m, "weight")
             and m.weight.shape[-1] % 64 == 0  # Skip layers not divisible by 64
             and hasattr(m, "to_quantized")
-            and model_quant_predicate(p, m, config)
+            and model_quant_predicate(p, m)
         )
 
     # Combine with user-provided predicate if available
@@ -366,8 +234,8 @@ def convert(
         quant_predicate = base_quant_requirements
     else:
         original_predicate = quant_predicate
-        quant_predicate = lambda p, m, config: (
-            base_quant_requirements(p, m, config) and original_predicate(p, m, config)
+        quant_predicate = lambda p, m: (
+            base_quant_requirements(p, m) and original_predicate(p, m)
         )
 
     weights = dict(tree_flatten(model.parameters()))

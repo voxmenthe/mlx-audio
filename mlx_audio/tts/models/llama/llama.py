@@ -1,6 +1,6 @@
 import time
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Generator, List, Optional, Union
 
 import mlx.core as mx
 from mlx_lm.generate import stream_generate
@@ -11,6 +11,7 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 
 from mlx_audio.codec.models.snac import SNAC
+from mlx_audio.utils import load_audio
 
 from ..base import GenerationResult
 
@@ -21,6 +22,9 @@ class ModelConfig(LlamaModelConfig):
     sample_rate: int = 24000
 
     def __post_init__(self):
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
+
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
 
@@ -29,6 +33,7 @@ snac_model = SNAC.from_pretrained("mlx-community/snac_24khz").eval()
 
 
 def decode_audio_from_codes(code_list):
+    """Decode a flat code list to audio."""
     layer_1 = []
     layer_2 = []
     layer_3 = []
@@ -47,6 +52,57 @@ def decode_audio_from_codes(code_list):
     ]
     audio_hat = snac_model.decode(codes).squeeze(-1)
     return audio_hat
+
+
+def codes_to_layers(code_list):
+    """Convert flat code list to layered format for SNAC."""
+    layer_1 = []
+    layer_2 = []
+    layer_3 = []
+    for i in range((len(code_list) + 1) // 7):
+        layer_1.append(code_list[7 * i])
+        layer_2.append(code_list[7 * i + 1] - 4096)
+        layer_3.append(code_list[7 * i + 2] - (2 * 4096))
+        layer_3.append(code_list[7 * i + 3] - (3 * 4096))
+        layer_2.append(code_list[7 * i + 4] - (4 * 4096))
+        layer_3.append(code_list[7 * i + 5] - (5 * 4096))
+        layer_3.append(code_list[7 * i + 6] - (6 * 4096))
+    return [
+        mx.expand_dims(mx.array(layer_1), 0),
+        mx.expand_dims(mx.array(layer_2), 0),
+        mx.expand_dims(mx.array(layer_3), 0),
+    ]
+
+
+def decode_audio_stream(code_list, prev_codes=None, context_frames=8):
+    """Streaming decode with context for smooth transitions.
+
+    Args:
+        code_list: Flat list of NEW codes from the model (not cumulative)
+        prev_codes: Previous context codes (layered format) or None
+        context_frames: Number of context frames for smooth decoding
+
+    Returns:
+        Tuple of (audio, new_context_codes)
+    """
+    codes = codes_to_layers(code_list)
+    audio, new_context = snac_model.decode_stream(codes, prev_codes, context_frames)
+    return audio.squeeze(-1), new_context
+
+
+def get_new_codes(all_codes, prev_code_count):
+    """Extract only the new codes from the full code list.
+
+    Args:
+        all_codes: Full list of codes generated so far
+        prev_code_count: Number of codes already processed
+
+    Returns:
+        List of new codes (empty if none)
+    """
+    if len(all_codes) <= prev_code_count:
+        return []
+    return all_codes[prev_code_count:]
 
 
 def encode_audio_to_codes(audio):
@@ -91,7 +147,6 @@ class Model(LlamaModel):
         token_to_find = 128257
         token_to_remove = 128258
 
-        # MLX doesn't have nonzero, so we need to create indices manually
         mask = input_ids == token_to_find
         indices = []
         for i in range(mask.shape[0]):
@@ -132,76 +187,175 @@ class Model(LlamaModel):
 
         return code_lists
 
-    def prepare_input_ids(
+    def prepare_zeroprompt(
         self,
-        prompts: List[str],
-        voice: Optional[str] = None,
-        ref_audio: Optional[mx.array] = None,
-        ref_text: Optional[str] = None,
+        ref_audio: mx.array,
+        ref_text: str,
     ):
-        audio_input_ids = None
-        if ref_audio is not None and ref_text is not None:
-            print(
-                "\033[93mWARNING: Audio cloning doesn't work reliably on Orpheus.\033[0m \nA known issue affecting Torch and MLX versions. \nWill be fixed once the Canopy labs repo update their code or the model."
-            )
-            audio_input_ids = encode_audio_to_codes(ref_audio) + 128266
-            audio_transcript_ids = self.tokenizer(
-                ref_text, return_tensors="mlx"
-            ).input_ids
-        elif voice is not None:
-            prompts = [f"{voice}: " + p for p in prompts]
+        """Prepare the reference audio context (zeroprompt) for voice cloning."""
+        print(
+            "\033[93mWARNING: Audio cloning doesn't work reliably on Orpheus.\033[0m \n"
+            "A known issue affecting Torch and MLX versions. \n"
+            "Will be fixed once the Canopy labs repo update their code or the model."
+        )
+        audio_input_ids = encode_audio_to_codes(ref_audio) + 128266
+        audio_transcript_ids = self.tokenizer(ref_text, return_tensors="mlx").input_ids
 
         start_token = mx.array([[128259]], dtype=mx.int64)  # Start of human
         end_tokens = mx.array(
             [[128009, 128260]], dtype=mx.int64
         )  # End of text, End of human
+        audio_start_tokens = mx.array([[128261, 128257]], dtype=mx.int64)
+        audio_end_tokens = mx.array([[128258, 128262]], dtype=mx.int64)
 
-        prompt_input_ids = []
-        for prompt in prompts:
-            prompt_input_ids.append(
-                self.tokenizer(prompt, return_tensors="mlx").input_ids
-            )
+        # [SOH] [transcript] [EOT EOH] [SOA SOS] [audio_tokens] [EOS EOA]
+        zeroprompt = mx.concatenate(
+            [
+                start_token,
+                audio_transcript_ids,
+                end_tokens,
+                audio_start_tokens,
+                audio_input_ids,
+                audio_end_tokens,
+            ],
+            axis=1,
+        )
+        return zeroprompt
 
-        batch_input_ids = []
-        pad_token = mx.array([128263], dtype=mx.int64)
-        max_len = max([p.shape[1] for p in prompt_input_ids])
+    def prepare_input_ids(
+        self,
+        prompt: Union[str, List[str]],
+        voice: Optional[str] = None,
+        zeroprompt: Optional[mx.array] = None,
+        ref_audio: Optional[mx.array] = None,
+        ref_text: Optional[str] = None,
+    ):
+        """Prepare input ids for a single prompt or batch of prompts, optionally with zeroprompt prefix.
 
-        for input_ids in prompt_input_ids:
-            modified_input_ids = []
+        Args:
+            prompt: Single prompt string or list of prompts for batch processing
+            voice: Voice name to prepend to prompts (e.g., "zoe")
+            zeroprompt: Pre-computed zeroprompt array for voice cloning
+            ref_audio: Reference audio for voice cloning (alternative to zeroprompt)
+            ref_text: Reference text caption for voice cloning (used with ref_audio)
 
-            padding_len = max_len - input_ids.shape[1]
-            if padding_len > 0:
-                modified_input_ids.append(mx.repeat(pad_token, padding_len)[None, :])
+        Returns:
+            If ref_audio/ref_text provided: tuple of (input_ids, input_mask)
+            Otherwise: input_ids array
+        """
+        # Compute zeroprompt from ref_audio/ref_text if provided
+        return_mask = False
+        if ref_audio is not None and ref_text is not None:
+            zeroprompt = self.prepare_zeroprompt(ref_audio, ref_text)
+            return_mask = True
 
-            # reference audio and transcript
-            if audio_input_ids is not None:
-                audio_start_tokens = mx.array([[128261, 128257]], dtype=mx.int64)
-                audio_end_tokens = mx.array([[128258, 128262]], dtype=mx.int64)
-                ref_input_ids = mx.concatenate(
-                    [
-                        start_token,
-                        audio_transcript_ids,
-                        end_tokens,
-                        audio_start_tokens,
-                        audio_input_ids,
-                        audio_end_tokens,
-                    ],
-                    axis=1,
-                )
-                modified_input_ids.append(ref_input_ids)
+        # Handle single prompt vs batch
+        if isinstance(prompt, str):
+            prompts = [prompt]
+        else:
+            prompts = prompt
 
-            # prompt
-            one_prompt_input_ids = mx.concatenate(
+        all_input_ids = []
+        all_lengths = []
+        for p in prompts:
+            if voice is not None and zeroprompt is None:
+                p = f"{voice}: {p}"
+
+            start_token = mx.array([[128259]], dtype=mx.int64)  # Start of human
+            end_tokens = mx.array(
+                [[128009, 128260]], dtype=mx.int64
+            )  # End of text, End of human
+
+            input_ids = self.tokenizer(p, return_tensors="mlx").input_ids
+            prompt_input_ids = mx.concatenate(
                 [start_token, input_ids, end_tokens], axis=1
-            )  # SOH SOT Text EOT EOH
-            modified_input_ids.append(one_prompt_input_ids)
+            )  # [SOH] [text] [EOT EOH]
 
-            batch_input_ids.append(mx.concatenate(modified_input_ids, axis=1))
+            if zeroprompt is not None:
+                prompt_input_ids = mx.concatenate(
+                    [zeroprompt, prompt_input_ids], axis=1
+                )
 
-        batch_input_ids = mx.concatenate(batch_input_ids, axis=0)
-        batch_mask = mx.where(batch_input_ids == pad_token, False, True)
+            all_input_ids.append(prompt_input_ids)
+            all_lengths.append(prompt_input_ids.shape[1])
 
-        return batch_input_ids, batch_mask
+        # If only one prompt, return as-is (keeps original behavior)
+        if len(all_input_ids) == 1:
+            if return_mask:
+                mask = mx.ones_like(all_input_ids[0], dtype=mx.int64)
+                return all_input_ids[0], mask
+            return all_input_ids[0]
+
+        # Pad to same length and stack for batch
+        max_len = max(ids.shape[1] for ids in all_input_ids)
+        padded = []
+        masks = []
+        for ids, length in zip(all_input_ids, all_lengths):
+            if ids.shape[1] < max_len:
+                padding = mx.zeros((1, max_len - ids.shape[1]), dtype=mx.int64)
+                ids = mx.concatenate([ids, padding], axis=1)
+            padded.append(ids)
+            # Create attention mask: 1 for real tokens, 0 for padding
+            mask = mx.concatenate(
+                [
+                    mx.ones((1, length), dtype=mx.int64),
+                    mx.zeros((1, max_len - length), dtype=mx.int64),
+                ],
+                axis=1,
+            )
+            masks.append(mask)
+
+        input_ids = mx.concatenate(padded, axis=0)
+        if return_mask:
+            input_mask = mx.concatenate(masks, axis=0)
+            return input_ids, input_mask
+        return input_ids
+
+    def generate_result(
+        self, audio, start_time: float, token_count: int, segment_idx: int, **kwargs
+    ) -> GenerationResult:
+        """Helper to create a GenerationResult from audio."""
+        samples = audio.shape[0] if audio is not None else 0
+        assert samples > 0, "No audio generated"
+
+        sample_rate = self.config.sample_rate
+        audio_duration_seconds = samples / sample_rate
+
+        elapsed_time = time.perf_counter() - start_time
+        rtf = audio_duration_seconds / elapsed_time if elapsed_time > 0 else 0
+
+        duration_hours = int(audio_duration_seconds // 3600)
+        duration_mins = int((audio_duration_seconds % 3600) // 60)
+        duration_secs = int(audio_duration_seconds % 60)
+        duration_ms = int((audio_duration_seconds % 1) * 1000)
+        duration_str = (
+            f"{duration_hours:02d}:{duration_mins:02d}:"
+            f"{duration_secs:02d}.{duration_ms:03d}"
+        )
+
+        return GenerationResult(
+            audio=audio,
+            samples=samples,
+            sample_rate=sample_rate,
+            segment_idx=segment_idx,
+            token_count=token_count,
+            audio_duration=duration_str,
+            real_time_factor=rtf,
+            prompt={
+                "tokens": token_count,
+                "tokens-per-sec": (
+                    round(token_count / elapsed_time, 2) if elapsed_time > 0 else 0
+                ),
+            },
+            audio_samples={
+                "samples": samples,
+                "samples-per-sec": (
+                    round(samples / elapsed_time, 2) if elapsed_time > 0 else 0
+                ),
+            },
+            processing_time_seconds=elapsed_time,
+            peak_memory_usage=mx.get_peak_memory() / 1e9,
+        )
 
     def generate(
         self,
@@ -212,19 +366,23 @@ class Model(LlamaModel):
         split_pattern: str = "\n",
         max_tokens: int = 1200,
         verbose: bool = False,
-        ref_audio: mx.array = None,
+        ref_audio: Optional[Union[str, mx.array]] = None,
         ref_text: Optional[str] = None,
+        stream: bool = False,
+        streaming_interval: float = 2.0,
         **kwargs,
     ):
-        prompt = text.replace("\\n", "\n").replace("\\t", "\t")
-        prompts = prompt.split(split_pattern)
+        # Load reference audio if provided (handles file paths and mx.array)
+        if ref_audio is not None:
+            ref_audio = load_audio(ref_audio, sample_rate=self.sample_rate)
 
-        input_ids, _ = self.prepare_input_ids(
-            prompts,
-            voice,
-            ref_audio,
-            ref_text,
-        )
+        prompt_text = text.replace("\\n", "\n").replace("\\t", "\t")
+        prompts = [p for p in prompt_text.split(split_pattern) if p.strip()]
+
+        # Prepare zeroprompt once if voice cloning is requested
+        zeroprompt = None
+        if ref_audio is not None and ref_text is not None:
+            zeroprompt = self.prepare_zeroprompt(ref_audio, ref_text)
 
         sampler = make_sampler(temperature, top_p, top_k=kwargs.get("top_k", -1))
         logits_processors = make_logits_processors(
@@ -233,92 +391,177 @@ class Model(LlamaModel):
             kwargs.get("repetition_context_size", 20),
         )
 
-        time_start = time.time()
-        # TODO: Support batch processing as in the Colab: https://github.com/canopyai/Orpheus-TTS
-        for i, response in enumerate(
-            tqdm(
-                stream_generate(
-                    self,
-                    tokenizer=self.tokenizer,
-                    prompt=input_ids.squeeze(0),
-                    max_tokens=max_tokens,
-                    sampler=sampler,
-                    logits_processors=logits_processors,
-                ),
-                total=max_tokens,
-                disable=not verbose,
+        streaming_token_interval = int(streaming_interval * 137.5)
+
+        # Process each prompt segment individually for memory efficiency
+        for segment_idx, segment_prompt in enumerate(prompts):
+            time_start = time.perf_counter()
+
+            # Prepare input_ids for this segment (with zeroprompt if voice cloning)
+            input_ids = self.prepare_input_ids(
+                segment_prompt,
+                voice,
+                zeroprompt,
             )
-        ):
-            next_token = mx.array([response.token])
-            input_ids = mx.concatenate([input_ids, next_token[None, :]], axis=1)
-            if i % 50 == 0:
-                mx.clear_cache()
 
-            if next_token == 128258:
-                break
+            generated_token_count = 0
+            yielded_token_count = 0
+            prev_code_count = 0
 
-        code_lists = self.parse_output(input_ids)
+            # Streaming decode context
+            prev_context_codes = None
 
-        my_samples = []
-        for code_list in code_lists:
-            samples = decode_audio_from_codes(code_list)
-            my_samples.append(samples)
-
-        time_end = time.time()
-
-        if len(prompts) != len(my_samples):
-            raise Exception("Number of prompts and samples do not match")
-        else:
-            for i in range(len(my_samples)):
-                audio = my_samples[i][0]
-
-                samples = audio.shape[0] if audio is not None else 0
-                assert samples > 0, "No audio generated"
-
-                # Calculate token count
-                token_count = input_ids.shape[1] if input_ids is not None else 0
-
-                # Calculate audio duration in seconds
-                sample_rate = self.config.sample_rate
-                audio_duration_seconds = samples / sample_rate
-
-                # Calculate real-time factor (RTF)
-                rtf = audio_duration_seconds / (time_end - time_start)
-
-                # Format duration as HH:MM:SS.mmm
-                duration_mins = int(audio_duration_seconds // 60)
-                duration_secs = int(audio_duration_seconds % 60)
-                duration_ms = int((audio_duration_seconds % 1) * 1000)
-                duration_hours = int(audio_duration_seconds // 3600)
-                duration_str = f"{duration_hours:02d}:{duration_mins:02d}:{duration_secs:02d}.{duration_ms:03d}"
-
-                yield GenerationResult(
-                    audio=audio,
-                    samples=samples,
-                    sample_rate=sample_rate,
-                    segment_idx=i,
-                    token_count=token_count,
-                    audio_duration=duration_str,
-                    real_time_factor=rtf,
-                    prompt={
-                        "tokens": token_count,
-                        "tokens-per-sec": (
-                            round(token_count / audio_duration_seconds, 2)
-                            if audio_duration_seconds > 0
-                            else 0
-                        ),
-                    },
-                    audio_samples={
-                        "samples": samples,
-                        "samples-per-sec": (
-                            round(samples / audio_duration_seconds, 2)
-                            if audio_duration_seconds > 0
-                            else 0
-                        ),
-                    },
-                    processing_time_seconds=time_end - time_start,
-                    peak_memory_usage=mx.get_peak_memory() / 1e9,
+            # Generate tokens for this segment
+            for i, response in enumerate(
+                tqdm(
+                    stream_generate(
+                        self,
+                        tokenizer=self.tokenizer,
+                        prompt=input_ids.squeeze(0),
+                        max_tokens=max_tokens,
+                        sampler=sampler,
+                        logits_processors=logits_processors,
+                    ),
+                    total=max_tokens,
+                    disable=not verbose,
+                    desc=f"Segment {segment_idx + 1}/{len(prompts)}",
                 )
+            ):
+                next_token = mx.array([response.token])
+                input_ids = mx.concatenate([input_ids, next_token[None, :]], axis=1)
+                generated_token_count += 1
 
-                # Clear cache after each segment to avoid memory leaks
-                mx.clear_cache()
+                if i % 50 == 0:
+                    mx.clear_cache()
+
+                # Stream partial audio at intervals
+                if stream and generated_token_count % streaming_token_interval == 0:
+                    code_lists = self.parse_output(input_ids)
+                    if code_lists and len(code_lists[0]) > 0:
+                        all_codes = code_lists[0]
+                        # Get only new codes since last decode
+                        new_codes = get_new_codes(all_codes, prev_code_count)
+
+                        # Need at least 7 codes for one frame
+                        if len(new_codes) >= 7:
+                            # Trim to complete frames (multiples of 7)
+                            num_frames = len(new_codes) // 7
+                            new_codes = new_codes[: num_frames * 7]
+
+                            # Use streaming decode with context
+                            audio, prev_context_codes = decode_audio_stream(
+                                new_codes,
+                                prev_context_codes,
+                                context_frames=8,
+                            )
+                            audio = audio[0]  # Remove batch dim
+
+                            if audio.shape[0] > 0:
+                                yield self.generate_result(
+                                    audio=audio,
+                                    start_time=time_start,
+                                    token_count=generated_token_count
+                                    - yielded_token_count,
+                                    segment_idx=segment_idx,
+                                )
+                                yielded_token_count = generated_token_count
+                                prev_code_count += len(new_codes)
+                                time_start = time.perf_counter()
+
+                if next_token == 128258:  # End of speech
+                    break
+
+            # Decode and yield remaining audio for this segment
+            code_lists = self.parse_output(input_ids)
+
+            for code_list in code_lists:
+                if len(code_list) == 0:
+                    continue
+
+                if stream:
+                    # Get remaining codes not yet decoded
+                    remaining_codes = get_new_codes(code_list, prev_code_count)
+                    if len(remaining_codes) >= 7:
+                        # Trim to complete frames
+                        num_frames = len(remaining_codes) // 7
+                        remaining_codes = remaining_codes[: num_frames * 7]
+
+                        audio, _ = decode_audio_stream(
+                            remaining_codes,
+                            prev_context_codes,
+                            context_frames=8,
+                        )
+                        audio = audio[0]
+
+                        if audio.shape[0] > 0:
+                            yield self.generate_result(
+                                audio=audio,
+                                start_time=time_start,
+                                token_count=generated_token_count - yielded_token_count,
+                                segment_idx=segment_idx,
+                            )
+                else:
+                    # Non-streaming: decode all at once
+                    audio = decode_audio_from_codes(code_list)[0]
+
+                    if audio.shape[0] > 0:
+                        yield self.generate_result(
+                            audio=audio,
+                            start_time=time_start,
+                            token_count=generated_token_count - yielded_token_count,
+                            segment_idx=segment_idx,
+                        )
+
+            # Clear cache after each segment to avoid memory buildup
+            mx.clear_cache()
+
+    def stream_generate(
+        self,
+        text: str,
+        voice: str = None,
+        temperature: float = 0.6,
+        top_p: float = 0.8,
+        split_pattern: str = "\n",
+        max_tokens: int = 1200,
+        streaming_interval: float = 2.0,
+        ref_audio: Optional[Union[str, mx.array]] = None,
+        ref_text: Optional[str] = None,
+        verbose: bool = False,
+        **kwargs,
+    ) -> Generator[GenerationResult, None, None]:
+        """
+        Stream generate speech from text, yielding audio chunks as they're generated.
+
+        This method generates audio in a streaming fashion, yielding audio chunks
+        as soon as they're ready. This allows for lower latency audio playback.
+
+        Args:
+            text: Input text to synthesize
+            voice: Voice name to use (e.g., "zoe", "tara")
+            temperature: Sampling temperature (default: 0.6)
+            top_p: Nucleus sampling threshold (default: 0.8)
+            split_pattern: Pattern to split text into segments (default: "\\n")
+            max_tokens: Maximum tokens per segment (default: 1200)
+            streaming_interval: Time interval in seconds between audio chunk yields (default: 2.0)
+            ref_audio: Optional reference audio for voice cloning
+            ref_text: Optional caption for reference audio (for voice cloning)
+            verbose: Whether to show progress bar (default: False)
+            **kwargs: Additional arguments (top_k, logit_bias, repetition_penalty, etc.)
+
+        Yields:
+            GenerationResult with generated audio chunks and metrics
+        """
+        yield from self.generate(
+            text=text,
+            voice=voice,
+            temperature=temperature,
+            top_p=top_p,
+            split_pattern=split_pattern,
+            max_tokens=max_tokens,
+            verbose=verbose,
+            ref_audio=ref_audio,
+            ref_text=ref_text,
+            stream=True,
+            streaming_interval=streaming_interval,
+            **kwargs,
+        )

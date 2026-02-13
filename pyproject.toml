@@ -1,0 +1,139 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mlx-audio"
+dynamic = ["version"]
+description = "MLX-Audio is a package for inference of text-to-speech (TTS) and speech-to-speech (STS) models locally on your Mac using MLX"
+readme = "README.md"
+license = "MIT"
+authors = [
+    {name = "Prince Canuma", email = "prince.gdt@gmail.com"}
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+requires-python = ">=3.10"
+
+# Core dependencies
+dependencies = [
+    "mlx>=0.25.2",
+    "numpy>=1.26.4",
+    "huggingface_hub>=0.27.0",
+    "transformers==5.0.0rc3",
+    "mlx-lm==0.30.5",
+    "tqdm>=4.67.1",
+    "sounddevice==0.5.3",
+    "miniaudio>=1.61",
+    "pyloudnorm>=0.2.0",
+    "numba>=0.60.0", # Required by librosa
+    "librosa==0.11.0",
+    "protobuf>=6.33.5",
+]
+
+[project.optional-dependencies]
+# STT dependencies
+stt = [
+    "tiktoken>=0.9.0",
+    "mistral-common[audio]",
+]
+
+# TTS dependencies
+tts = [
+    "misaki>=0.9.4",
+    "num2words>=0.5.14",
+    "spacy>=3.8.4",
+    "phonemizer-fork>=3.3.2",
+    "espeakng-loader>=0.2.4",
+    "sentencepiece>=0.2.0",
+]
+
+# Server dependencies
+server = [
+    "fastapi>=0.95.0",
+    "uvicorn>=0.22.0",
+    "python-multipart>=0.0.22"
+]
+
+# STS (Speech-to-Speech) requires both STT and TTS + additional deps
+sts = [
+    "tiktoken>=0.9.0",
+    "mistral-common[audio]",
+
+    "misaki>=0.9.4",
+    "num2words>=0.5.14",
+    "spacy>=3.8.4",
+    "phonemizer-fork>=3.3.2",
+    "espeakng-loader>=0.2.4",
+    "sentencepiece>=0.2.0",
+    
+    "webrtcvad>=2.0.10",
+]
+
+# Full installation (all features)
+all = [
+    "tiktoken>=0.9.0",
+    "mistral-common[audio]",
+
+    "misaki>=0.9.4",
+    "num2words>=0.5.14",
+    "spacy>=3.8.4",
+    "phonemizer-fork>=3.3.2",
+    "espeakng-loader>=0.2.4",
+    "sentencepiece>=0.2.0",
+
+    "fastapi>=0.95.0",
+    "uvicorn>=0.22.0",
+
+    "webrtcvad>=2.0.10",
+]
+
+# Development dependencies
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=1.0.0",
+    "black>=24.2.0",
+    "isort>=5.13.2",
+    "pre-commit>=3.7.0",
+]
+
+[project.scripts]
+"mlx_audio.convert" = "mlx_audio.convert:main"
+"mlx_audio.stt.generate" = "mlx_audio.stt.generate:main"
+"mlx_audio.tts.generate" = "mlx_audio.tts.generate:main"
+"mlx_audio.server" = "mlx_audio.server:main"
+
+[project.urls]
+Homepage = "https://github.com/Blaizzy/mlx-audio"
+Repository = "https://github.com/Blaizzy/mlx-audio"
+
+[tool.poetry]
+version = "0.0.0"
+
+[tool.setuptools.dynamic]
+version = {attr = "mlx_audio.version.__version__"}
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mlx_audio", "mlx_audio.*"]
+
+[tool.setuptools.package-data]
+mlx_audio = [
+    "tts/*.html",
+    "tts/*.js",
+    "tts/*.css",
+    "tts/**/*.json",
+    "tts/static/**/*",
+]
+
+[tool.black]
+line-length = 88
+target-version = ["py310"]
+
+[tool.isort]
+profile = "black"
